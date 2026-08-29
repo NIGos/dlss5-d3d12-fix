@@ -1,8 +1,8 @@
 #include <windows.h>
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    2,6,0,0
- PRODUCTVERSION 2,6,0,0
+ FILEVERSION    2,6,1,0
+ PRODUCTVERSION 2,6,1,0
  FILEOS         VOS_NT_WINDOWS32
  FILETYPE       VFT_DLL
 BEGIN
@@ -11,11 +11,11 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "FileDescription",  "DLSS 5 D3D12 Mip Fix"
-            VALUE "FileVersion",      "2.6.0.0"
+            VALUE "FileVersion",      "2.6.1.0"
             VALUE "InternalName",     "dlss5-d3d12-fix"
             VALUE "OriginalFilename", "dlss5-d3d12-fix.addon64"
             VALUE "ProductName",      "DLSS 5 D3D12 Mip Fix"
-            VALUE "ProductVersion",   "2.6.0.0"
+            VALUE "ProductVersion",   "2.6.1.0"
         END
     END
     BLOCK "VarFileInfo"

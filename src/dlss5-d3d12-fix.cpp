@@ -47,7 +47,7 @@
 #include <cstdarg>
 #include <cstdint>
 
-#define PROBE_VERSION "2.6.0"
+#define PROBE_VERSION "2.6.1"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 D3D12 Mip Fix " PROBE_VERSION;
@@ -898,6 +898,17 @@ static NVSDK_NGX_Result Detour_CreateFeature(void *cmdlist, int feature_id,
     Log("CreateFeature id=%d (%s) -> 0x%08X %s handle=%p", feature_id, what, r,
         ResultName(static_cast<unsigned>(r)),
         (out != nullptr) ? static_cast<void *>(*out) : nullptr);
+
+    // A failed neural-rendering creation is not by itself a fault. The DLSS 5
+    // add-on tries this entry point first and, when it is refused, creates the
+    // feature through a signed snippet instead -- a route that does not pass
+    // through the export hooked here, so its success cannot be seen from this
+    // log. Read as a failure on its own it sends you looking for a problem that
+    // the next line of the add-on's own log says was never there.
+    if (r != NGX_SUCCESS && feature_id == 18)
+        Log("  a first attempt refused here is usually followed by a successful "
+            "creation through another route, which this log cannot see. Check "
+            "the DLSS 5 add-on's own log before treating this as the fault.");
 
     if (r == NGX_SUCCESS && out != nullptr)
     {
