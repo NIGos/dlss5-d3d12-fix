@@ -123,7 +123,17 @@ two reasons applies — DLSS never initialised, or it did and no DLSS 5 add-on
 detoured it.
 
 If no resource is ever flagged, this add-on has nothing to do and the problem is
-elsewhere. It is not a general remedy for DLSS 5 failing to start; it treats one
+elsewhere.
+
+The opposite case is reported too. Substituting steadily while the DLSS 5 add-on
+never creates a neural-rendering feature means this add-on's work is being done
+and the neural pass is not running — a state the numbers alone look healthy in:
+
+```
+[note] 10916 evaluates have been substituted and the DLSS 5 add-on has not once
+created a neural-rendering feature (NGX id 18). Its neural pass is not running,
+and the cause is upstream of this add-on.
+``` It is not a general remedy for DLSS 5 failing to start; it treats one
 specific defect. The totals can be lined up against the consumer's own counters:
 a gap between them is a set of frames the substitution missed.
 
@@ -176,3 +186,7 @@ to stay in step.
 The first line of the log names the exact build. Post that plus the resource
 descriptors and the last stats line — between them they identify the build, the
 contract the game asked for, and whether the substitution was running.
+
+Post `ReShade.log` as well. The DLSS 5 add-on writes its own lines there, and
+they are the other half of the answer: this log can show that a single-mip
+texture was supplied and still not show what was done with it.

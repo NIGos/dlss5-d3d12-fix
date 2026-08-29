@@ -783,6 +783,8 @@ typedef int (*PFN_SlEvaluate)(void *, void *, void *, unsigned int, void *);
 
 static Hook          g_hook_sl;
 static volatile LONG g_sl_count;
+static volatile LONG g_saw_nr_create;
+static volatile LONG g_said_no_nr;
 static volatile LONG g_did_substitute;
 static volatile LONG g_did_skip;
 
@@ -899,6 +901,8 @@ static NVSDK_NGX_Result Detour_CreateFeature(void *cmdlist, int feature_id,
         ResultName(static_cast<unsigned>(r)),
         (out != nullptr) ? static_cast<void *>(*out) : nullptr);
 
+    if (feature_id == 18) InterlockedExchange(&g_saw_nr_create, 1);
+
     // A failed neural-rendering creation is not by itself a fault. The DLSS 5
     // add-on tries this entry point first and, when it is refused, creates the
     // feature through a signed snippet instead -- a route that does not pass
@@ -953,6 +957,22 @@ static NVSDK_NGX_Result Detour_Evaluate(void *cmdlist, const NVSDK_NGX_Handle *h
         Log("[stats] NGX evaluates seen %ld | substituted %ld | skipped %ld | "
             "Streamline evaluates %ld",
             n, g_did_substitute, g_did_skip, g_sl_count);
+
+    // Substituting steadily while the consumer never asks for a neural feature
+    // is the one state this log used to leave ambiguous. The numbers above look
+    // healthy, the screen is unchanged, and nothing says which half is at
+    // fault. It is worth stating outright: this add-on's work is being done and
+    // the neural pass is not running, which is not a thing it can cause or
+    // cure. Said once, after enough frames that a slow start is ruled out.
+    if (n >= 3600 && g_did_substitute > 0 &&
+        InterlockedCompareExchange(&g_saw_nr_create, 0, 0) == 0 &&
+        InterlockedCompareExchange(&g_said_no_nr, 1, 0) == 0)
+        Log("[note] %ld evaluates have been substituted and the DLSS 5 add-on has "
+            "not once created a neural-rendering feature (NGX id 18). Its neural "
+            "pass is not running, and the cause is upstream of this add-on: check "
+            "that nvngx_dlssnr.dll is present next to ReShade, that neural "
+            "rendering is enabled in its panel, and read ReShade.log for its own "
+            "lines.", g_did_substitute);
 
     // Preferred route: leave every resource exactly as the game passed it and
     // only change what GetDesc reports while the call is in flight.
@@ -1281,7 +1301,16 @@ static void StopWatchingForNgx()
 // partway through the session.
 static void ReportOutcome()
 {
-    if (InterlockedCompareExchange(&g_installed, 0, 0) != 0) return;
+    if (InterlockedCompareExchange(&g_installed, 0, 0) != 0)
+    {
+        if (g_did_substitute > 0 &&
+            InterlockedCompareExchange(&g_saw_nr_create, 0, 0) == 0)
+            Log("Substituted %ld evaluates this session, and the DLSS 5 add-on "
+                "never created a neural-rendering feature. Everything this "
+                "add-on exists to do was done; the neural pass never started.",
+                g_did_substitute);
+        return;
+    }
     if (InterlockedCompareExchange(&g_ngx_seen, 0, 0) == 0)
         Log("No module exporting NVSDK_NGX_D3D12_EvaluateFeature ever appeared. "
             "DLSS was not initialised in this session.");
