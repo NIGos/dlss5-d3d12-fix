@@ -47,7 +47,7 @@
 #include <cstdarg>
 #include <cstdint>
 
-#define PROBE_VERSION "2.5.0"
+#define PROBE_VERSION "2.5.1"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 D3D12 Mip Fix " PROBE_VERSION;
@@ -501,15 +501,40 @@ static bool ShouldSubstitute(const NVSDK_NGX_Handle *h)
     return id == 1;
 }
 
+static void CfgPath(char *path)
+{
+    GetModuleFileNameA(g_self, path, MAX_PATH);
+    if (char *s = strrchr(path, '\\'))
+        strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "dlss5-d3d12-fix.cfg");
+}
+
+// Every default is written out on first run, so the file states what this
+// build actually does rather than leaving it to the documentation. 2.5.0
+// wrote no file and defaulted use_vtable to 1 -- the mode that hangs the GPU,
+// kept only as a record of what was tried -- while the documentation said 0.
+// A fresh install therefore ran in it: the consumer's mip check passed on a
+// texture that never really had one mip, and it failed further downstream.
+static void CfgWriteDefault()
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
+
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
+    fprintf(f, "fix=1\nsub_output=1\nsub_depth=1\npreload_output=1\ncopyback=1\n"
+               "use_vtable=0\nnr_quality=-2\n");
+    fclose(f);
+    Log("wrote default config to %s", path);
+}
+
 static int FixEnabled()
 {
     if (g_fix >= 0) return g_fix;
     g_fix = 1;
 
     char path[MAX_PATH];
-    GetModuleFileNameA(g_self, path, MAX_PATH);
-    if (char *s = strrchr(path, '\\'))
-        strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "dlss5-d3d12-fix.cfg");
+    CfgPath(path);
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "r") == 0 && f != nullptr)
@@ -535,9 +560,7 @@ static int FixEnabled()
 static int CfgFlag(const char *key, int fallback)
 {
     char path[MAX_PATH];
-    GetModuleFileNameA(g_self, path, MAX_PATH);
-    if (char *s = strrchr(path, '\\'))
-        strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "dlss5-d3d12-fix.cfg");
+    CfgPath(path);
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "r") != 0 || f == nullptr) return fallback;
@@ -600,7 +623,7 @@ static int UseVtable()
     static int v = -1;
     if (v < 0)
     {
-        v = CfgFlag("use_vtable", 1);
+        v = CfgFlag("use_vtable", 0);
         Log("Method: %s", v ? "report MipLevels=1 via GetDesc (no substitution)"
                             : "substitute single-mip textures");
     }
@@ -614,12 +637,10 @@ static int QualityOverride()
 {
     static int q = -3;
     if (q != -3) return q;
-    q = -1;
+    q = -2;
 
     char path[MAX_PATH];
-    GetModuleFileNameA(g_self, path, MAX_PATH);
-    if (char *s = strrchr(path, '\\'))
-        strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "dlss5-d3d12-fix.cfg");
+    CfgPath(path);
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "r") == 0 && f != nullptr)
@@ -1178,6 +1199,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 
         Log("dlss5-d3d12-fix %s (built %s %s) attached. Read-only: every call is "
             "forwarded unchanged.", PROBE_VERSION, __DATE__, __TIME__);
+        CfgWriteDefault();
         CreateThread(nullptr, 0, &WatcherThread, nullptr, 0, nullptr);
     }
     else if (reason == DLL_PROCESS_DETACH)
