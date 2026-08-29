@@ -43,6 +43,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
@@ -223,6 +224,125 @@ static void HookRestore(Hook &h) { if (h.active) WriteCode(h.target, h.patch, si
 // Parameter reporting
 // ---------------------------------------------------------------------------
 
+typedef BOOL (WINAPI *PFN_EnumProcessModules)(HANDLE, HMODULE *, DWORD, LPDWORD);
+
+// ---------------------------------------------------------------------------
+// The environment
+//
+// Reports that say only "it does nothing" cannot be acted on. Most of what is
+// needed to answer them can be read from this process: which files are beside
+// the add-on, which of them the loader actually mapped, what else is taking
+// part, and which GPU is being asked to do the work.
+// ---------------------------------------------------------------------------
+
+// Only NVIDIA's own model file is named. The DLSS 5 add-on's filename belongs
+// to its author and is not this add-on's to require; the listing of every
+// *.addon* below shows what is present without naming one.
+static void LogNeighbours()
+{
+    wchar_t dir[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, dir, MAX_PATH);
+    if (wchar_t *s = wcsrchr(dir, L'\\')) *(s + 1) = L'\0';
+
+    static const wchar_t *needed[] = { L"nvngx_dlssnr.dll", L"nvngx_dlss.dll" };
+
+    Log("  files next to this add-on:");
+    for (int i = 0; i < 2; ++i)
+    {
+        wchar_t path[MAX_PATH];
+        wcscpy_s(path, dir);
+        wcscat_s(path, needed[i]);
+        const bool here = GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+        Log("    %-22ls %s%s", needed[i], here ? "present" : "MISSING",
+            (!here && i == 0) ? "   <== the DLSS 5 add-on loads its neural model from this file"
+                              : "");
+    }
+
+    wchar_t pattern[MAX_PATH];
+    wcscpy_s(pattern, dir);
+    wcscat_s(pattern, L"*.addon*");
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        Log("  add-ons present, so conflicts are visible:");
+        do { Log("    %ls", fd.cFileName); } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+}
+
+// Present on disk and mapped into the process are different facts, and they
+// separate "the file was never installed" from "it was, and the feature still
+// failed".
+static void LogNgxModules()
+{
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (k32 == nullptr) return;
+    auto enum_modules =
+        reinterpret_cast<PFN_EnumProcessModules>(GetProcAddress(k32, "K32EnumProcessModules"));
+    if (enum_modules == nullptr) return;
+
+    HMODULE mods[1024];
+    DWORD   needed = 0;
+    if (!enum_modules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return;
+
+    Log("  loaded modules that take part in DLSS:");
+    bool any = false;
+    for (DWORD i = 0; i < needed / sizeof(HMODULE); ++i)
+    {
+        const bool ngx = GetProcAddress(mods[i], "NVSDK_NGX_D3D12_CreateFeature") != nullptr;
+
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(mods[i], path, MAX_PATH);
+        const wchar_t *leaf = wcsrchr(path, L'\\');
+        leaf = leaf ? leaf + 1 : path;
+
+        const bool interesting = (_wcsnicmp(leaf, L"sl.", 3) == 0) ||
+                                 (wcsstr(leaf, L"nvngx") != nullptr);
+        if (!ngx && !interesting) continue;
+
+        Log("    %ls%s", path, ngx ? "  -> exports NGX D3D12" : "");
+        any = true;
+    }
+    if (!any)
+        Log("    none. NGX is not loaded, so DLSS has not been initialised.");
+}
+
+// The GPU generation is the first thing to establish when a feature initialises
+// and then produces nothing: a model that a driver will load is not necessarily
+// one the hardware can run.
+static void LogAdapter(ID3D12Device *dev)
+{
+    static volatile LONG done;
+    if (dev == nullptr || InterlockedCompareExchange(&done, 1, 0) != 0) return;
+
+    HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+    if (dxgi == nullptr) return;
+    typedef HRESULT (WINAPI *PFN_CreateFactory)(REFIID, void **);
+    auto create = reinterpret_cast<PFN_CreateFactory>(
+        GetProcAddress(dxgi, "CreateDXGIFactory1"));
+    if (create == nullptr) return;
+
+    IDXGIFactory4 *factory = nullptr;
+    if (FAILED(create(__uuidof(IDXGIFactory4), reinterpret_cast<void **>(&factory))) ||
+        factory == nullptr)
+        return;
+
+    IDXGIAdapter1 *adapter = nullptr;
+    if (SUCCEEDED(factory->EnumAdapterByLuid(dev->GetAdapterLuid(), __uuidof(IDXGIAdapter1),
+                                             reinterpret_cast<void **>(&adapter))) &&
+        adapter != nullptr)
+    {
+        DXGI_ADAPTER_DESC1 d = {};
+        if (SUCCEEDED(adapter->GetDesc1(&d)))
+            Log("GPU: %ls (vendor 0x%04X device 0x%04X, %llu MB dedicated)",
+                d.Description, d.VendorId, d.DeviceId,
+                static_cast<unsigned long long>(d.DedicatedVideoMemory >> 20));
+        adapter->Release();
+    }
+    factory->Release();
+}
+
 // Reading through a pointer the probe did not create, so it is guarded.
 static void SafePeek(const void *p, unsigned long long *out, int count)
 {
@@ -258,6 +378,8 @@ static void DescribeResource(const char *key, ID3D12Resource *res)
     if (FAILED(res->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&dev))) ||
         dev == nullptr)
         return;
+
+    LogAdapter(dev);
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
     fs.Format = d.Format;
@@ -800,7 +922,6 @@ static int Detour_SlEvaluate(void *a, void *b, void *c, unsigned int d, void *e)
     return r;
 }
 
-typedef BOOL (WINAPI *PFN_EnumProcessModules)(HANDLE, HMODULE *, DWORD, LPDWORD);
 
 static HMODULE FindStreamline(void **out_eval)
 {
@@ -1107,7 +1228,6 @@ static NVSDK_NGX_Result Detour_Evaluate(void *cmdlist, const NVSDK_NGX_Handle *h
 // Discovery
 // ---------------------------------------------------------------------------
 
-typedef BOOL (WINAPI *PFN_EnumProcessModules)(HANDLE, HMODULE *, DWORD, LPDWORD);
 
 static HMODULE FindNgxLoader()
 {
@@ -1227,6 +1347,7 @@ static void TryInstallHooks()
     Log("Hooks: EvaluateFeature=%s CreateFeature=%s slEvaluateFeature=%s",
         ok ? "installed" : "FAILED", ok_create ? "installed" : "FAILED",
         sl_eval == nullptr ? "absent" : (ok_sl ? "installed (counting only)" : "FAILED"));
+    LogNgxModules();
 }
 
 // Both the loaded and unloaded notifications carry this shape.
@@ -1318,6 +1439,7 @@ static void ReportOutcome()
         Log("NGX was loaded but its entry point was never detoured. Either the "
             "DLSS 5 add-on is not present, or it never installed. Nothing was "
             "hooked and nothing was substituted.");
+    LogNgxModules();
 }
 
 // ---------------------------------------------------------------------------
@@ -1380,6 +1502,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         Log("dlss5-d3d12-fix %s (built %s %s) attached. Read-only: every call is "
             "forwarded unchanged.", PROBE_VERSION, __DATE__, __TIME__);
         CfgWriteDefault();
+        LogNeighbours();
         StartWatchingForNgx();
     }
     else if (reason == DLL_PROCESS_DETACH)
