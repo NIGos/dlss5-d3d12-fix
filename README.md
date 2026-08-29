@@ -3,9 +3,13 @@
 A ReShade add-on that makes a DLSS 5 neural-rendering add-on work in a DirectX 12
 game whose DLSS output carries a mip chain.
 
-Tested on Resonance: A Plague Tale Legacy — D3D12, Streamline, with Ray
-Reconstruction and Frame Generation enabled. Nothing in it is specific to that
-game.
+**Written for Resonance: A Plague Tale Legacy** — D3D12, Streamline, with Ray
+Reconstruction and Frame Generation enabled. That is the game it was built
+against and the only one it is known to fix.
+
+Nothing in the code is specific to it: every size, format and resource is read
+from the parameter block the caller passes. Whether other titles carry the same
+defect is an open question, and the log answers it in the first second of play.
 
 ## The symptom
 
