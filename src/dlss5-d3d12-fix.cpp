@@ -47,7 +47,7 @@
 #include <cstdarg>
 #include <cstdint>
 
-#define PROBE_VERSION "2.5.1"
+#define PROBE_VERSION "2.6.0"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 D3D12 Mip Fix " PROBE_VERSION;
@@ -70,6 +70,37 @@ struct ID3D11Resource;  // opaque; only ever held as a pointer
 
 typedef int NVSDK_NGX_Result;
 static const NVSDK_NGX_Result NGX_SUCCESS = 1;
+
+// NGX only ever returns 0xBAD000xx, and the bare number sends people to the
+// wrong place: 0xBAD0000C is a version mismatch and has nothing to do with the
+// resources this add-on touches. The name goes next to it.
+static const char *ResultName(unsigned r)
+{
+    switch (r)
+    {
+    case 0x00000001: return "Success";
+    case 0xBAD00000: return "Fail";
+    case 0xBAD00001: return "FeatureNotSupported";
+    case 0xBAD00002: return "PlatformError";
+    case 0xBAD00003: return "FeatureAlreadyExists";
+    case 0xBAD00004: return "FeatureNotFound";
+    case 0xBAD00005: return "InvalidParameter";
+    case 0xBAD00006: return "ScratchBufferTooSmall";
+    case 0xBAD00007: return "NotInitialized";
+    case 0xBAD00008: return "UnsupportedInputFormat";
+    case 0xBAD00009: return "RWFlagMissing";
+    case 0xBAD0000A: return "MissingInput";
+    case 0xBAD0000B: return "UnableToInitializeFeature";
+    case 0xBAD0000C: return "OutOfDate";
+    case 0xBAD0000D: return "OutOfGPUMemory";
+    case 0xBAD0000E: return "UnsupportedFormat";
+    case 0xBAD0000F: return "UnableToWriteToAppDataPath";
+    case 0xBAD00010: return "UnsupportedParameter";
+    case 0xBAD00011: return "Denied";
+    case 0xBAD00012: return "NotImplemented";
+    default:         return "unrecognised";
+    }
+}
 
 struct NVSDK_NGX_Handle { unsigned int Id; };
 
@@ -864,7 +895,8 @@ static NVSDK_NGX_Result Detour_CreateFeature(void *cmdlist, int feature_id,
                      : feature_id == 11 ? "RayReconstruction"
                      : feature_id == 10 ? "FrameGeneration"
                      : feature_id == 18 ? "NeuralRendering" : "other";
-    Log("CreateFeature id=%d (%s) -> 0x%08X handle=%p", feature_id, what, r,
+    Log("CreateFeature id=%d (%s) -> 0x%08X %s handle=%p", feature_id, what, r,
+        ResultName(static_cast<unsigned>(r)),
         (out != nullptr) ? static_cast<void *>(*out) : nullptr);
 
     if (r == NGX_SUCCESS && out != nullptr)
@@ -1034,7 +1066,9 @@ static NVSDK_NGX_Result Detour_Evaluate(void *cmdlist, const NVSDK_NGX_Handle *h
 
     LeaveCriticalSection(&g_state_cs);
 
-    if (n <= 3) Log("--- #%ld returned 0x%08X ---", n, r);
+    if (n <= 3)
+        Log("--- #%ld returned 0x%08X %s ---", n, r,
+            ResultName(static_cast<unsigned>(r)));
     return r;
 }
 
@@ -1079,65 +1113,171 @@ static bool IsDetoured(const void *fn)
            (p[0] == 0x48 && p[1] == 0xB8) || (p[0] == 0xEB);
 }
 
-static DWORD WINAPI WatcherThread(LPVOID)
+// ---------------------------------------------------------------------------
+// Finding the moment to install
+//
+// Two things have to be true before installing: NGX is loaded, and the DLSS 5
+// add-on has already detoured the entry point. Waiting for the second is what
+// puts this add-on's substitution in front of that one's mip check.
+//
+// The obvious way to wait is a polling thread, and that is what every version
+// up to 2.5.1 used. A ReShade add-on can be unloaded at any moment -- some
+// games load and discard them inside a startup hardware-detection pass -- and a
+// thread still executing inside a module that has left memory terminates the
+// process. The loader is asked to report library arrivals instead, so there is
+// no thread to be caught out and no window in which one could be.
+//
+// Being detoured is not itself a library event, so a notification can arrive a
+// moment too early. That is answered by checking again on every later arrival:
+// a game loads libraries continuously and the check is a byte comparison. If it
+// never becomes true nothing is installed, and the log says so at unload rather
+// than leaving the question open.
+// ---------------------------------------------------------------------------
+
+typedef void (CALLBACK *PFN_LdrDllNotification)(ULONG reason, const void *data, void *ctx);
+typedef LONG (NTAPI *PFN_LdrRegisterDllNotification)(ULONG, PFN_LdrDllNotification, void *, void **);
+typedef LONG (NTAPI *PFN_LdrUnregisterDllNotification)(void *);
+
+static void *g_ldr_cookie;
+static PFN_LdrUnregisterDllNotification g_ldr_unregister;
+static volatile LONG g_installed;
+static volatile LONG g_ngx_seen;
+static HMODULE       g_ngx_mod;
+static HMODULE       g_sl_mod;
+
+// Safe to call repeatedly and from the loader callback: it does nothing once
+// the hooks are in, and everything it does before that is a name lookup.
+static void TryInstallHooks()
 {
-    // Two things have to be true before installing: NGX is loaded, and another
-    // add-on has already hooked the entry point. Waiting for the second is what
-    // puts this probe downstream of it.
-    for (int i = 0; ; ++i)
+    if (InterlockedCompareExchange(&g_installed, 0, 0) != 0) return;
+
+    HMODULE ngx = FindNgxLoader();
+    if (ngx == nullptr) return;
+    InterlockedExchange(&g_ngx_seen, 1);
+
+    void *eval = reinterpret_cast<void *>(
+        GetProcAddress(ngx, "NVSDK_NGX_D3D12_EvaluateFeature"));
+    if (eval == nullptr || !IsDetoured(eval)) return;
+
+    void *create = reinterpret_cast<void *>(
+        GetProcAddress(ngx, "NVSDK_NGX_D3D12_CreateFeature"));
+    void   *sl_eval = nullptr;
+    HMODULE sl      = FindStreamline(&sl_eval);
+
+    // Reached from the loader notification, holding the loader lock. A detour
+    // holds this section across the forwarded NGX call, and NGX loads its
+    // snippets from inside those calls. Blocking here would then be this thread
+    // holding the loader lock and waiting for the section, while the thread
+    // holding the section waits for the loader lock inside NGX: nothing would
+    // crash and every frame would stop. A chance missed here comes round on the
+    // next library that loads. A deadlock does not.
+    if (!TryEnterCriticalSection(&g_hook_cs)) return;
+    const bool ok = HookInstall(g_hook, eval,
+                                reinterpret_cast<void *>(&Detour_Evaluate));
+    const bool ok_create = create != nullptr &&
+        HookInstall(g_hook_create, create,
+                    reinterpret_cast<void *>(&Detour_CreateFeature));
+    const bool ok_sl = sl_eval != nullptr &&
+        HookInstall(g_hook_sl, sl_eval, reinterpret_cast<void *>(&Detour_SlEvaluate));
+    g_ngx_mod = ngx;
+    g_sl_mod  = ok_sl ? sl : nullptr;
+    LeaveCriticalSection(&g_hook_cs);
+
+    // The moment has been found either way. If the write itself failed it will
+    // fail again, so this does not come round a second time.
+    InterlockedExchange(&g_installed, 1);
+
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(ngx, path, MAX_PATH);
+    Log("NGX loader: %ls", path);
+    LogEntryBytes("NVSDK_NGX_D3D12_EvaluateFeature", eval);
+    Log("Entry point is already detoured by another add-on. Installing "
+        "downstream of it.");
+    Log("Hooks: EvaluateFeature=%s CreateFeature=%s slEvaluateFeature=%s",
+        ok ? "installed" : "FAILED", ok_create ? "installed" : "FAILED",
+        sl_eval == nullptr ? "absent" : (ok_sl ? "installed (counting only)" : "FAILED"));
+}
+
+// Both the loaded and unloaded notifications carry this shape.
+struct LdrDllNotificationData
+{
+    ULONG       Flags;
+    const void *FullDllName;
+    const void *BaseDllName;
+    void       *DllBase;
+    ULONG       SizeOfImage;
+};
+
+// A hooked module can be unloaded while this add-on still holds the address of
+// a patched function and the bytes it saved from it. Writing those bytes back
+// afterwards lands in memory that is gone. Drop the hook instead.
+static void ForgetUnloadedModule(const void *base)
+{
+    if (base == nullptr) return;
+    // Also reached under the loader lock; see TryInstallHooks. Missing an
+    // unload costs a stale record. Blocking costs the process.
+    if (!TryEnterCriticalSection(&g_hook_cs)) return;
+    if (g_ngx_mod != nullptr && base == static_cast<const void *>(g_ngx_mod))
     {
-        HMODULE ngx = FindNgxLoader();
-        if (ngx != nullptr)
-        {
-            void *eval = reinterpret_cast<void *>(
-                GetProcAddress(ngx, "NVSDK_NGX_D3D12_EvaluateFeature"));
-            if (eval != nullptr && IsDetoured(eval))
-            {
-                wchar_t path[MAX_PATH] = {};
-                GetModuleFileNameW(ngx, path, MAX_PATH);
-                Log("NGX loader: %ls", path);
-                LogEntryBytes("NVSDK_NGX_D3D12_EvaluateFeature", eval);
-                Log("Entry point is already detoured by another add-on. Installing "
-                    "downstream of it.");
-
-                void *create = reinterpret_cast<void *>(
-                    GetProcAddress(ngx, "NVSDK_NGX_D3D12_CreateFeature"));
-
-                EnterCriticalSection(&g_hook_cs);
-                const bool ok = HookInstall(g_hook, eval,
-                                            reinterpret_cast<void *>(&Detour_Evaluate));
-                const bool ok_create = create != nullptr &&
-                    HookInstall(g_hook_create, create,
-                                reinterpret_cast<void *>(&Detour_CreateFeature));
-                LeaveCriticalSection(&g_hook_cs);
-                void *sl_eval = nullptr;
-                bool  ok_sl   = false;
-                if (FindStreamline(&sl_eval) != nullptr && sl_eval != nullptr)
-                {
-                    EnterCriticalSection(&g_hook_cs);
-                    ok_sl = HookInstall(g_hook_sl, sl_eval,
-                                        reinterpret_cast<void *>(&Detour_SlEvaluate));
-                    LeaveCriticalSection(&g_hook_cs);
-                }
-                Log("Hooks: EvaluateFeature=%s CreateFeature=%s slEvaluateFeature=%s",
-                    ok ? "installed" : "FAILED", ok_create ? "installed" : "FAILED",
-                    sl_eval == nullptr ? "absent" : (ok_sl ? "installed (counting only)" : "FAILED"));
-                return 0;
-            }
-
-            if (i == 300)
-                Log("NGX is loaded but NVSDK_NGX_D3D12_EvaluateFeature is not detoured. "
-                    "Either the DLSS 5 add-on is not present, or it has not hooked yet. "
-                    "Still checking.");
-        }
-        else if (i == 300)
-        {
-            Log("No module exporting NVSDK_NGX_D3D12_EvaluateFeature yet. DLSS has "
-                "probably not been initialised. Still checking.");
-        }
-
-        Sleep(i < 300 ? 200 : 2000);
+        g_hook.active = g_hook_create.active = false;
+        g_ngx_mod = nullptr;
+        Log("the NGX module has been unloaded; its hooks are dropped rather than "
+            "written back to memory that is gone.");
     }
+    if (g_sl_mod != nullptr && base == static_cast<const void *>(g_sl_mod))
+    {
+        g_hook_sl.active = false;
+        g_sl_mod = nullptr;
+    }
+    LeaveCriticalSection(&g_hook_cs);
+}
+
+static void CALLBACK OnDllEvent(ULONG reason, const void *data, void *)
+{
+    // 1 is LDR_DLL_NOTIFICATION_REASON_LOADED, 2 is UNLOADED. This runs under
+    // the loader lock, so it does the least it can.
+    if (reason == 1) TryInstallHooks();
+    else if (reason == 2 && data != nullptr)
+        ForgetUnloadedModule(static_cast<const LdrDllNotificationData *>(data)->DllBase);
+}
+
+static void StartWatchingForNgx()
+{
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    auto reg = nt != nullptr ? reinterpret_cast<PFN_LdrRegisterDllNotification>(
+        GetProcAddress(nt, "LdrRegisterDllNotification")) : nullptr;
+    g_ldr_unregister = nt != nullptr ? reinterpret_cast<PFN_LdrUnregisterDllNotification>(
+        GetProcAddress(nt, "LdrUnregisterDllNotification")) : nullptr;
+
+    if (reg != nullptr) reg(0, &OnDllEvent, nullptr, &g_ldr_cookie);
+    else Log("loader notifications unavailable; NGX will only be found if it is "
+             "already loaded");
+
+    // It may already be there, in which case no notification is coming.
+    TryInstallHooks();
+}
+
+static void StopWatchingForNgx()
+{
+    if (g_ldr_cookie != nullptr && g_ldr_unregister != nullptr)
+    {
+        g_ldr_unregister(g_ldr_cookie);
+        g_ldr_cookie = nullptr;
+    }
+}
+
+// Said at unload, when the answer is known, rather than guessed at from a timer
+// partway through the session.
+static void ReportOutcome()
+{
+    if (InterlockedCompareExchange(&g_installed, 0, 0) != 0) return;
+    if (InterlockedCompareExchange(&g_ngx_seen, 0, 0) == 0)
+        Log("No module exporting NVSDK_NGX_D3D12_EvaluateFeature ever appeared. "
+            "DLSS was not initialised in this session.");
+    else
+        Log("NGX was loaded but its entry point was never detoured. Either the "
+            "DLSS 5 add-on is not present, or it never installed. Nothing was "
+            "hooked and nothing was substituted.");
 }
 
 // ---------------------------------------------------------------------------
@@ -1200,15 +1340,17 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         Log("dlss5-d3d12-fix %s (built %s %s) attached. Read-only: every call is "
             "forwarded unchanged.", PROBE_VERSION, __DATE__, __TIME__);
         CfgWriteDefault();
-        CreateThread(nullptr, 0, &WatcherThread, nullptr, 0, nullptr);
+        StartWatchingForNgx();
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        StopWatchingForNgx();
         EnterCriticalSection(&g_hook_cs);
         HookRemove(g_hook);
         HookRemove(g_hook_create);
         g_hook.active = g_hook_create.active = false;
         LeaveCriticalSection(&g_hook_cs);
+        ReportOutcome();
         if (g_unregister != nullptr) g_unregister(g_self);
     }
     return TRUE;

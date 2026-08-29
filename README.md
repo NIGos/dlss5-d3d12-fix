@@ -110,8 +110,17 @@ with which of the consumer's requirements it meets, and running totals:
 ```
 Output  desc: dim=3 3733x1600 slices=1 mips=12 fmt=26 samples=1 flags=0x5 UAV   <== NOT a plain single-slice single-mip 2D texture
         format 26: shader sample yes, typed UAV store yes
+CreateFeature id=1 (SuperSampling) -> 0x00000001 Success handle=000001C415F21B68
 [stats] NGX evaluates seen 9000 | substituted 8991 | skipped 0 | Streamline evaluates 6902
 ```
+
+NGX results are named as well as numbered. The number alone is a poor guide:
+`0xBAD0000C` is a version mismatch and has nothing to do with the resources this
+add-on touches.
+
+If the entry point is never hooked, the last line of the log says which of the
+two reasons applies — DLSS never initialised, or it did and no DLSS 5 add-on
+detoured it.
 
 If no resource is ever flagged, this add-on has nothing to do and the problem is
 elsewhere. It is not a general remedy for DLSS 5 failing to start; it treats one
@@ -133,6 +142,9 @@ artefact into a hang.
   documents: inputs as shader resources, the output as a UAV. A game that
   differs would need different barriers. This is the most fragile assumption.
 - Feature identification uses the standard NGX ids.
+- Installing depends on catching the moment the other add-on hooks NGX, which is
+  detected from library-load notifications. An add-on that hooked late, after
+  the last library a game loads, would not be seen.
 - Tested on one game, one GPU.
 - Verbose logging is always on.
 
