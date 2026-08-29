@@ -83,6 +83,20 @@ Plus a D3D12 game with DLSS.
 This add-on installs itself only once the other one has hooked the NGX entry
 point, so it always sits downstream of it and sees exactly what it sees.
 
+### Hardware
+
+Every report of the neural pass never starting has come from RTX 40-series
+hardware, and in one of them NGX refuses the neural-rendering feature outright:
+
+```
+[DLSS 5 Neural Rendering] DLSS5 Generic: feature 18 create failed with 0xbad00001
+```
+
+`0xBAD00001` is `FAIL_FeatureNotSupported`. There is so far no report of DLSS 5
+neural rendering working below RTX 50-series. That is a limit of the feature
+rather than of this add-on, which substitutes normally in those sessions — the
+log shows the substitution running and no neural feature ever created.
+
 ## Install
 
 Drop `dlss5-d3d12-fix.addon64` next to ReShade. It writes its own
