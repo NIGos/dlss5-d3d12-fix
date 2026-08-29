@@ -1426,10 +1426,18 @@ static void ReportOutcome()
     {
         if (g_did_substitute > 0 &&
             InterlockedCompareExchange(&g_saw_nr_create, 0, 0) == 0)
+        {
             Log("Substituted %ld evaluates this session, and the DLSS 5 add-on "
                 "never created a neural-rendering feature. Everything this "
                 "add-on exists to do was done; the neural pass never started.",
                 g_did_substitute);
+            // Listed again here rather than only at hook time, because the
+            // neural model is loaded later than that -- late enough that the
+            // earlier list is taken before it would appear. Whether it is here
+            // now separates a model that was never loaded from one that was and
+            // produced nothing.
+            LogNgxModules();
+        }
         return;
     }
     if (InterlockedCompareExchange(&g_ngx_seen, 0, 0) == 0)

@@ -104,8 +104,25 @@ Drop `dlss5-d3d12-fix.addon64` next to ReShade. It writes its own
 
 ## Log
 
-`dlss5-d3d12-fix.log` reports the NGX contract, a descriptor for every resource
-with which of the consumer's requirements it meets, and running totals:
+`dlss5-d3d12-fix.log` opens with the environment — which of the required files
+are beside the add-on, which of them the process actually loaded, what else is
+hooked into the same frame, and the GPU:
+
+```
+  files next to this add-on:
+    nvngx_dlssnr.dll       present
+  add-ons present, so conflicts are visible:
+    dlss5-d3d12-fix.addon64
+    renodx-dlss5.addon64
+GPU: NVIDIA GeForce RTX 5090 (vendor 0x10DE device 0x2B85, 32187 MB dedicated)
+```
+
+Present on disk and loaded into the process are logged separately: the first
+says a file was never installed, the second says it was and the feature failed
+anyway.
+
+It then reports the NGX contract, a descriptor for every resource with which of
+the consumer's requirements it meets, and running totals:
 
 ```
 Output  desc: dim=3 3733x1600 slices=1 mips=12 fmt=26 samples=1 flags=0x5 UAV   <== NOT a plain single-slice single-mip 2D texture
