@@ -1,0 +1,8 @@
+*.obj
+*.res
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.log
+*.cfg
