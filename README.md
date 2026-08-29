@@ -1,5 +1,16 @@
 # DLSS 5 D3D12 Mip Fix
 
+> ### Superseded from DLSS 5 Neural Rendering v3.3.5
+>
+> That add-on now handles a mipped DLSS output itself, reporting
+> `DLSS output has N mip levels; NR consumes and replaces mip 0 only`. Update it
+> rather than installing this. Confirmed on Resonance: A Plague Tale Legacy,
+> where v3.3.5 produces the neural pass with this add-on set to `fix=0`.
+>
+> This remains useful only where that add-on cannot be updated. Everything below
+> describes the defect as it stood before v3.3.5 and is accurate for those
+> versions.
+
 A ReShade add-on that makes a DLSS 5 neural-rendering add-on work in a DirectX 12
 game whose DLSS output carries a mip chain.
 
